@@ -2,22 +2,20 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const NodeCache = require('node-cache');
 const winston = require('winston');
-const express = require('express');
-const bodyParser = require('body-parser');
+const WebSocket = require('ws');
 const fetch = require('node-fetch');
 
 // ======== إعدادات البيئة ========
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
+const QUICKNODE_WS_URL = process.env.QUICKNODE_WS_URL || 'wss://yolo-wider-knowledge.solana-mainnet.quiknode.pro/25f92089969ab99aff86c2b35d5b7080782cdda6';
+const QUICKNODE_HTTP_URL = process.env.QUICKNODE_HTTP_URL || 'https://yolo-wider-knowledge.solana-mainnet.quiknode.pro/25f92089969ab99aff86c2b35d5b7080782cdda6';
+const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const PORT = process.env.PORT || 3000;
 
-if (!BOT_TOKEN || !MORALIS_API_KEY) {
-  console.error('يجب تعيين BOT_TOKEN و MORALIS_API_KEY في البيئة!');
+if (!BOT_TOKEN || !QUICKNODE_WS_URL || !QUICKNODE_HTTP_URL) {
+  console.error('يجب تعيين BOT_TOKEN و QUICKNODE_WS_URL و QUICKNODE_HTTP_URL في ملف .env!');
   process.exit(1);
 }
-
-// تسجيل تحميل مفتاح API
-console.log(`مفتاح API المستخدم: ${MORALIS_API_KEY ? 'تم تحميله' : 'غير موجود'}`);
 
 // ======== إعداد المسجل (Logger) ========
 const logger = winston.createLogger({
@@ -33,22 +31,19 @@ const logger = winston.createLogger({
   ]
 });
 
-logger.info(`مفتاح API المستخدم: ${MORALIS_API_KEY ? 'تم تحميله' : 'غير موجود'}`);
+logger.info(`QuickNode WebSocket URL: ${QUICKNODE_WS_URL}`);
+logger.info(`QuickNode HTTP URL: ${QUICKNODE_HTTP_URL}`);
 
 // ======== إعداد التخزين المؤقت ========
 const tokenCache = new NodeCache({ stdTTL: 300 });
 const userCache = new NodeCache();
 
-// ======== تهيئة بوت التلجرام مع معالجة أخطاء الاستطلاع ========
+// ======== تهيئة بوت التلجرام ========
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 bot.on('polling_error', (error) => {
   logger.error(`خطأ في استطلاع Telegram: ${error.message}`, { stack: error.stack });
 });
-
-// ======== تهيئة خادم Express لاستقبال التحديثات (اختياري) ========
-const app = express();
-app.use(bodyParser.json());
 
 // ======== دالة تهريب الأحرف الخاصة لماركداون ========
 function escapeMarkdown(text) {
@@ -57,173 +52,136 @@ function escapeMarkdown(text) {
   return text.replace(reservedChars, '\\$1');
 }
 
-// ======== دالة استخراج عنوان المينت من السجلات (للاستخدام المستقبلي) ========
-function extractMintAddressFromLogs(logs) {
-  for (const log of logs) {
-    if (log.startsWith('Program log: Mint pubkey:')) {
-      const parts = log.split(':');
-      if (parts.length >= 2) {
-        return parts[1].trim();
-      }
-    }
-  }
-  return null;
-}
-
-// ======== فلتر العملات المزيفة/المشبوهة ========
-function isSuspiciousToken(tokenInfo) {
-  const suspiciousPatterns = [
-    /BTC/i, /ETH/i, /SOL/i, /USDT/i, /USDC/i, // تشابه مع عملات معروفة
-    /^[A-Za-z0-9]{1,3}$/, // رموز قصيرة جدًا
-    /^[^A-Za-z0-9]+$/, // أحرف غريبة فقط
-  ];
-  const name = tokenInfo.name || '';
-  const symbol = tokenInfo.symbol || '';
-  const socials = tokenInfo.socials || {};
-
-  for (const pattern of suspiciousPatterns) {
-    if (pattern.test(name) || pattern.test(symbol)) {
-      logger.debug(`تم تجاهل العملة بسبب اسم/رمز مشبوه: ${name}/${symbol}`, { mint: tokenInfo.mint });
-      return true;
-    }
-  }
-
-  // فلتر التواصل الاجتماعي (معطل، قم بإلغاء التعليق لتفعيله)
-  /*
-  if (!socials.twitter && !socials.telegram) {
-    logger.debug(`تم تجاهل العملة بسبب عدم وجود روابط X أو Telegram`, { mint: tokenInfo.mint });
-    return true;
-  }
-  */
-
-  return false;
-}
-
-// ======== دالة لإعادة المحاولة مع تأخير عشوائي ========
-async function fetchWithRetry(url, options, retries = 5, baseDelay = 3000) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(url, options);
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`);
-      }
-      return response;
-    } catch (error) {
-      if (i < retries - 1) {
-        const jitter = Math.random() * 100;
-        const delay = baseDelay + jitter;
-        logger.warn(`فشل الطلب، إعادة المحاولة ${i + 1}/${retries} بعد ${delay}ms: ${error.message}`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        continue;
-      }
-      throw error;
-    }
-  }
-}
-
-// ======== مراقبة العملات الجديدة عبر Moralis Pump Fun API ========
-async function pollNewTokens(userId) {
+// ======== الحصول على معلومات التوكن باستخدام QuickNode RPC ========
+async function getTokenInfo(tokenAddress) {
+  const tokenInfo = {
+    name: 'غير معروف',
+    symbol: '?',
+    price: 0,
+    liquidity: 0,
+    marketCap: 0,
+    mint: tokenAddress,
+    socials: {}
+  };
   try {
-    const response = await fetchWithRetry(
-      'https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/new?limit=20',
-      {
-        method: 'GET',
-        headers: {
-          accept: 'application/json',
-          'X-API-Key': MORALIS_API_KEY
+    // جلب بيانات الميتاداتا باستخدام getAccountInfo
+    const response = await fetch(QUICKNODE_HTTP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getAccountInfo',
+        params: [
+          tokenAddress,
+          { encoding: 'jsonParsed' }
+        ]
+      })
+    });
+    const data = await response.json();
+    if (data.result && data.result.value) {
+      const accountData = data.result.value.data.parsed.info;
+      tokenInfo.name = accountData.metadata?.name || tokenInfo.name;
+      tokenInfo.symbol = accountData.metadata?.symbol || tokenInfo.symbol;
+    }
+
+    // جلب السعر والسيولة والقيمة السوقية باستخدام Birdeye API (اختياري)
+    const birdeyeResponse = await fetch(`https://public-api.birdeye.so/public/price?address=${tokenAddress}`, {
+      headers: { 'X-API-KEY': process.env.BIRDEYE_API_KEY || '' }
+    });
+    if (birdeyeResponse.ok) {
+      const priceData = await birdeyeResponse.json();
+      tokenInfo.price = priceData.data?.value || tokenInfo.price;
+      tokenInfo.liquidity = priceData.data?.liquidity || tokenInfo.liquidity;
+      tokenInfo.marketCap = priceData.data?.marketCap || tokenInfo.marketCap;
+    } else {
+      logger.warn('فشل جلب بيانات السعر من Birdeye API', { mint: tokenAddress });
+    }
+  } catch (error) {
+    logger.error(`خطأ في جلب معلومات التوكن: ${error.message}`, { stack: error.stack, mint: tokenAddress });
+  }
+  return tokenInfo;
+}
+
+// ======== مراقبة معاملات Pump.fun عبر QuickNode WebSocket ========
+async function pollNewTokens(userId) {
+  const ws = new WebSocket(QUICKNODE_WS_URL);
+
+  ws.on('open', () => {
+    logger.info('WebSocket متصل');
+    const request = {
+      jsonrpc2: '2.0',
+      id: 1,
+      method: 'programSubscribe',
+      params: [
+        PUMP_FUN_PROGRAM,
+        { encoding: 'jsonParsed', commitment: 'confirmed' }
+      ]
+    };
+    ws.send(JSON.stringify(request));
+    // إرسال ping كل 30 ثانية للحفاظ على الاتصال
+    setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+        logger.debug('تم إرسال ping');
+      }
+    }, 30000);
+  });
+
+  ws.on('message', async (data) => {
+    try {
+      const messageStr = data.toString('utf8');
+      const messageObj = JSON.parse(messageStr);
+      if (messageObj.params && messageObj.params.result) {
+        const result = messageObj.params.result;
+        const logs = result.value.transaction.meta.logMessages;
+        const accountKeys = result.value.transaction.transaction.message.accountKeys.map(ak => ak.pubkey);
+        const signature = result.value.signature;
+
+        if (logs && logs.some(log => log.includes('Program log: Instruction: InitializeMint2'))) {
+          const tokenAddress = accountKeys[1]; // التوكن هو المفتاح الثاني
+          logger.info(`تم اكتشاف توكن جديد: ${tokenAddress}`, { signature });
+
+          if (tokenCache.has(tokenAddress)) {
+            logger.debug(`تم تجاهل العملة بسبب وجودها في التخزين المؤقت: ${tokenAddress}`);
+            return;
+          }
+
+          tokenCache.set(tokenAddress, true);
+          await broadcastNewToken({ mint: tokenAddress, created_at: new Date() }, 'pumpfun', userId);
         }
       }
-    );
+    } catch (error) {
+      logger.error(`خطأ في معالجة رسالة WebSocket: ${error.message}`, { stack: error.stack });
+    }
+  });
 
-    const data = await response.json();
-    logger.info(`تم استرجاع ${data.result?.length || 0} عملة من Moralis API`, { response: data });
+  ws.on('error', (err) => {
+    logger.error(`خطأ في WebSocket: ${err.message}`, { stack: err.stack });
+    bot.sendMessage(userId, escapeMarkdown(`❌ خطأ في WebSocket: ${err.message}`), { parse_mode: 'MarkdownV2' });
+  });
 
-    if (data.result && Array.isArray(data.result) && data.result.length > 0) {
-      const latestToken = data.result.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-      const coin = {
-        mint: latestToken.tokenAddress,
-        created_at: latestToken.createdAt
-      };
-      await handleNewToken(coin, 'pumpfun', userId);
-    } else {
-      logger.info('لم يتم العثور على عملات جديدة في هذه الدقيقة');
-      await bot.sendMessage(userId, escapeMarkdown('❌ لم يتم العثور على عملات جديدة في هذه اللحظة'), { parse_mode: 'MarkdownV2' });
-    }
-  } catch (error) {
-    logger.error(`خطأ في جلب العملات الجديدة من Moralis: ${error.message}`, { stack: error.stack });
-    await bot.sendMessage(userId, escapeMarkdown(`❌ خطأ: ${error.message}`), { parse_mode: 'MarkdownV2' });
-  }
-}
-
-// ======== معالجة العملة الجديدة ========
-async function handleNewToken(coin, service, userId) {
-  try {
-    const createdAt = new Date(coin.created_at).getTime();
-    const ageInSeconds = Math.floor((Date.now() - createdAt) / 1000);
-    if (ageInSeconds > 60) {
-      logger.debug(`تم تجاهل العملة بسبب العمر: ${ageInSeconds} ثانية`, { mint: coin.mint });
-      return;
-    }
-    if (tokenCache.has(coin.mint)) {
-      logger.debug(`تم تجاهل العملة بسبب وجودها في التخزين المؤقت: ${coin.mint}`);
-      return;
-    }
-    const tokenInfo = await getTokenInfo(coin.mint);
-    if (isSuspiciousToken(tokenInfo)) {
-      return;
-    }
-    tokenCache.set(coin.mint, true);
-    await broadcastNewToken(coin, ageInSeconds, service, userId);
-  } catch (error) {
-    logger.error(`خطأ في معالجة العملة الجديدة من ${service}: ${error.message}`, { stack: error.stack, coin });
-    await bot.sendMessage(userId, escapeMarkdown(`❌ خطأ في معالجة العملة: ${error.message}`), { parse_mode: 'MarkdownV2' });
-  }
+  ws.on('close', () => {
+    logger.info('WebSocket مغلق، جاري إعادة الاتصال...');
+    setTimeout(() => pollNewTokens(userId), 5000); // إعادة المحاولة بعد 5 ثوانٍ
+  });
 }
 
 // ======== بث التنبيهات للمستخدمين ========
-async function broadcastNewToken(coin, ageInSeconds, service, userId) {
+async function broadcastNewToken(coin, service, userId) {
   try {
     const tokenInfo = await getTokenInfo(coin.mint);
+    const ageInSeconds = Math.floor((Date.now() - new Date(coin.created_at).getTime()) / 1000);
     const message = formatTokenMessage(tokenInfo, ageInSeconds);
     await bot.sendMessage(userId, message, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
     logger.info(`تم إرسال عملة جديدة إلى ${userId} عبر ${service}`, { userId, service, mint: coin.mint });
     // إيقاف الاستطلاع بعد إرسال نتيجة واحدة
     userCache.del(userId);
-    isPolling = false;
     await bot.sendMessage(userId, escapeMarkdown('🛑 تم إيقاف المراقبة. اضغط "مراقبة عبر Pump.fun" لإعادة التفعيل.'), { parse_mode: 'MarkdownV2' });
   } catch (error) {
     logger.error(`خطأ في بث العملة من ${service}: ${error.message}`, { stack: error.stack, coin });
     await bot.sendMessage(userId, escapeMarkdown(`❌ خطأ في إرسال العملة: ${error.message}`), { parse_mode: 'MarkdownV2' });
   }
-}
-
-// ======== الحصول على معلومات العملة ========
-async function getTokenInfo(tokenAddress) {
-  const tokenInfo = { name: 'غير معروف', symbol: '?', price: 0, liquidity: 0, marketCap: 0, mint: tokenAddress, socials: {} };
-  try {
-    const response = await fetchWithRetry(
-      `https://solana-gateway.moralis.io/token/mainnet/${tokenAddress}/price`,
-      {
-        method: 'GET',
-        headers: {
-          accept: 'application/json',
-          'X-API-Key': MORALIS_API_KEY
-        }
-      }
-    );
-
-    const data = await response.json();
-    tokenInfo.name = data.name || tokenInfo.name;
-    tokenInfo.symbol = data.symbol || tokenInfo.symbol;
-    tokenInfo.price = data.usdPrice || tokenInfo.price;
-    tokenInfo.liquidity = data.liquidity?.usd || tokenInfo.liquidity;
-    tokenInfo.marketCap = data.fullyDilutedValuation || tokenInfo.marketCap;
-    tokenInfo.socials = data.socials || tokenInfo.socials;
-  } catch (error) {
-    logger.error(`خطأ في جلب معلومات التوكن: ${error.message}`, { stack: error.stack, mint: tokenAddress });
-  }
-  return tokenInfo;
 }
 
 // ======== تنسيق رسالة التنبيه ========
@@ -277,43 +235,43 @@ bot.on('callback_query', async (query) => {
   if (data === 'select_pumpfun') {
     userCache.set(userId, 'pumpfun');
     await bot.sendMessage(userId, escapeMarkdown('✅ *تم تفعيل المراقبة عبر Pump.fun! جاري البحث عن عملة جديدة...*'), { parse_mode: 'MarkdownV2' });
-    await pollNewTokens(userId); // استطلاع مرة واحدة
+    await pollNewTokens(userId);
   } else if (data === 'stop_monitoring') {
     userCache.del(userId);
-    isPolling = false;
     await bot.sendMessage(userId, escapeMarkdown('🛑 *تم إيقاف المراقبة!*'), { parse_mode: 'MarkdownV2' });
   } else if (data === 'system_status') {
     const usersPumpFun = userCache.keys().filter(key => userCache.get(key) === 'pumpfun').length;
     const status = escapeMarkdown(`
 *حالة النظام:*
-• Pump.fun: ${isPolling ? '🟢 المراقبة نشطة' : '🔴 المراقبة غير نشطة'}
+• Pump.fun: ${userCache.has(userId) ? '🟢 المراقبة نشطة' : '🔴 المراقبة غير نشطة'}
 • مستخدمو Pump.fun: ${usersPumpFun}
     `).trim();
     await bot.sendMessage(userId, status, { parse_mode: 'MarkdownV2' });
   }
 });
 
-// ======== التحقق من مفتاح API ========
-async function checkApiKey() {
+// ======== التحقق من QuickNode RPC ========
+async function checkRpc() {
   try {
-    const response = await fetchWithRetry(
-      'https://solana-gateway.moralis.io/token/mainnet/9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump/price',
-      {
-        method: 'GET',
-        headers: {
-          accept: 'application/json',
-          'X-API-Key': MORALIS_API_KEY
-        }
-      }
-    );
-    logger.info('مفتاح API صالح، بدء تشغيل المراقبة...');
+    const response = await fetch(QUICKNODE_HTTP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getSlot'
+      })
+    });
+    if (!response.ok) {
+      throw new Error('فشل التحقق من QuickNode RPC');
+    }
+    logger.info('QuickNode RPC صالح، بدء تشغيل المراقبة...');
   } catch (error) {
-    logger.error(`خطأ في التحقق من مفتاح API: ${error.message}`, { stack: error.stack });
+    logger.error(`خطأ في التحقق من QuickNode RPC: ${error.message}`, { stack: error.stack });
     process.exit(1);
   }
 }
 
-// ======== بدء تشغيل الخادم والتحقق من مفتاح API ========
-app.listen(PORT, () => logger.info(`الخادم يعمل على المنفذ ${PORT}`));
-checkApiKey();
+// ======== بدء تشغيل البوت والتحقق من RPC ========
+checkRpc();
 logger.info('تم بدء تشغيل البوت بنجاح!');
